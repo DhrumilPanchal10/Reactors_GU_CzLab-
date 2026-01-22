@@ -1,0 +1,127 @@
+# client.py
+"""
+Minimal ReactorOpcClient that connects to an OPC-UA server, subscribes to variables,
+stores them in a dictionary, and provides write and method-calling utilities.
+
+Usage:
+from client import ReactorOpcClient
+rc = ReactorOpcClient("opc.tcp://localhost:4840/freeopcua/server/")
+await rc.connect()
+# rc.write("ns=2;i=28", 42.0)  # example
+"""
+
+import asyncio
+from asyncua import Client, ua
+from dataclasses import dataclass
+from typing import Dict, Any
+
+@dataclass
+class NodeInfo:
+    nodeid: str
+    node: Any
+    value: Any
+
+class ReactorOpcClient:
+    def __init__(self, endpoint: str, reactor_name: str = None):
+        """
+        endpoint: opc.tcp endpoint string
+        reactor_name: optional "R0", "R1", "R2" for convenience
+        """
+        self.endpoint = endpoint
+        self.client = Client(endpoint)
+        self.variables: Dict[str, NodeInfo] = {}
+        self.reactor_name = reactor_name or ""
+
+    async def connect(self):
+        await self.client.connect()
+        # after connect, we can browse or register nodes manually
+        # We'll not auto-discover everything here; GUI will request specific NodeIds.
+        print(f"Connected to {self.endpoint}")
+
+    async def disconnect(self):
+        await self.client.disconnect()
+        print("Disconnected")
+
+    async def add_variable(self, nodeid_str: str, friendly_name: str = None):
+        """
+        Register a node for reading/updating in variables dict.
+        nodeid_str example: "ns=2;i=28" or NodeId instance accepted too.
+        """
+        try:
+            node = self.client.get_node(nodeid_str)
+            val = await node.read_value()
+            self.variables[nodeid_str] = NodeInfo(nodeid=nodeid_str, node=node, value=val)
+            return self.variables[nodeid_str]
+        except Exception as e:
+            print(f"Error adding variable {nodeid_str}: {e}")
+            raise
+
+    async def refresh(self):
+        """
+        Refresh values for all registered variables (simple synchronous refresh).
+        """
+        for nid, info in list(self.variables.items()):
+            try:
+                v = await info.node.read_value()
+                info.value = v
+            except Exception as e:
+                print(f"refresh error for {nid}: {e}")
+
+    async def write(self, nodeid: str, value):
+        """
+        Write a value to the node identified by nodeid.
+        nodeid: "ns=2;i=28" or numeric id if you prefer, but pass the exact string.
+        value: python native (int/float/str/bool). Will be converted automatically.
+        Returns True on success, raises on failure.
+        """
+        # Basic sanity checks
+        if not isinstance(nodeid, str):
+            raise ValueError("nodeid must be a string like 'ns=2;i=28'")
+
+        node = self.client.get_node(nodeid)
+        # read data type to convert correctly if needed
+        try:
+            # Attempt to write using appropriate UA Variant based on current data type
+            current = await node.read_value()
+            # Use simple heuristics to pick Ua VariantType
+            if isinstance(current, bool):
+                variant = ua.Variant(bool(value), ua.VariantType.Boolean)
+            elif isinstance(current, int):
+                variant = ua.Variant(int(value), ua.VariantType.Int64)
+            elif isinstance(current, float):
+                variant = ua.Variant(float(value), ua.VariantType.Double)
+            else:
+                # fallback to string
+                variant = ua.Variant(str(value), ua.VariantType.String)
+            await node.write_value(variant)
+            # update cache if present
+            if nodeid in self.variables:
+                self.variables[nodeid].value = value
+            return True
+        except Exception as e:
+            # Try generic write_value fallback
+            try:
+                await node.write_value(value)
+                if nodeid in self.variables:
+                    self.variables[nodeid].value = value
+                return True
+            except Exception as e2:
+                print(f"Write failed for {nodeid}: {e2}")
+                raise
+
+    async def call_method(self, object_nodeid: str, method_nodeid: str, *args):
+        """
+        Call a method on the server.
+        object_nodeid: the NodeId of the Object that owns the method (string)
+        method_nodeid: NodeId of the Method to call (string)
+        args: method arguments
+        Returns: list of return values
+        """
+        obj = self.client.get_node(object_nodeid)
+        method = self.client.get_node(method_nodeid)
+        try:
+            result = await obj.call_method(method, *args)
+            return result
+        except Exception as e:
+            print(f"Method call failed: object {object_nodeid}, method {method_nodeid}, err: {e}")
+            raise
