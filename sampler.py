@@ -2,89 +2,67 @@
 import asyncio
 from datetime import datetime, timezone
 import sys
-import sqlite3
+from typing import Any
 
 from client import ReactorOpcClient
-from variable_map import reactor_map_R0
-import db
+from db import ensure_db, create_experiment, insert_sample
 
 ENDPOINT = "opc.tcp://localhost:4840/freeopcua/server/"
-
-POLL_DEFAULT = 1.0
-
-
-def utc_now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
+DEFAULT_REACTOR = "R0"
 
 
-async def main(poll_s: float):
-    # 1) Ensure DB + create an experiment row
-    db.ensure_db()
-    exp_id = db.create_experiment(
+def _is_number(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+async def main():
+    ensure_db()
+
+    reactor = DEFAULT_REACTOR
+    exp_id = create_experiment(
         name="Stage2 demo run",
-        reactor="R0",
-        started_at_utc=utc_now_iso(),
+        reactor=reactor,
+        started_at_utc=datetime.now(timezone.utc).isoformat(),
     )
 
-    # 2) Build variable map + connect client
-    varmap = reactor_map_R0()
-    client = ReactorOpcClient(endpoint=ENDPOINT, variables=varmap)
-
+    client = ReactorOpcClient(endpoint=ENDPOINT)
     await client.connect()
-    print(f"✅ Sampler connected to {ENDPOINT}")
-    print(f"✅ Logging to {db.DB_PATH} (experiment_id={exp_id})")
-    print(f"⏱️ Interval: {poll_s}s (Ctrl+C to stop)")
 
-    # 3) Main loop: read all nodes, write once per cycle
+    print(f"✅ Connected to {ENDPOINT}")
+    print(f"✅ Experiment created exp_id={exp_id}")
+    print("✅ Starting subscriptions (no polling)")
+
+    # On every subscribed value change: log numeric to DB
+    def on_change(nodeid: str, value: Any):
+        try:
+            # Decide whether it's a sensor or actuator based on client dicts
+            info = client.sensor_vars.get(nodeid) or client.actuator_vars.get(nodeid)
+            if not info:
+                return
+
+            # only log numeric values to samples.value
+            if not _is_number(value):
+                return
+
+            ts = datetime.now(timezone.utc).isoformat()
+            tag = f"{info['reactor']}:{info['name']}:{info['channel']}"
+            insert_sample(exp_id, ts, nodeid, tag, float(value))
+        except Exception:
+            # do not crash callback
+            return
+
+    await client.init_subscriptions(on_change=on_change)
+
+    print("⏱️ Sampler running. Ctrl+C to stop.")
     try:
         while True:
-            ts = utc_now_iso()
-
-            rows = []
-            for nodeid, info in varmap.items():
-                try:
-                    v = await client.read(nodeid)
-
-                    # Only store numeric values in samples.value (REAL)
-                    if isinstance(v, (int, float)):
-                        tag = f"{info.reactor}:{info.group}:{info.channel}"
-                        rows.append((exp_id, ts, nodeid, tag, float(v)))
-                    else:
-                        # Example: method="PWM" -> skip (not numeric)
-                        continue
-
-                except Exception as e:
-                    # One-line warning, no stack spam
-                    print(f"[WARN] read failed {info.reactor}:{info.group}:{info.channel} {nodeid}: {e}")
-
-            # 4) Bulk insert rows in a single transaction (FAST)
-            if rows:
-                try:
-                    with sqlite3.connect(db.DB_PATH) as con:
-                        cur = con.cursor()
-                        cur.executemany(
-                            "INSERT INTO samples (experiment_id, ts_utc, nodeid, tag, value) VALUES (?, ?, ?, ?, ?)",
-                            rows,
-                        )
-                        con.commit()
-                    print(f"[OK] {ts} inserted {len(rows)} samples")
-                except Exception as e:
-                    print(f"[WARN] DB write failed: {e}")
-
-            await asyncio.sleep(poll_s)
-
+            await asyncio.sleep(1.0)
     finally:
         await client.disconnect()
-        print("🛑 sampler stopped")
 
 
 if __name__ == "__main__":
-    poll = POLL_DEFAULT
-    if len(sys.argv) > 1:
-        poll = float(sys.argv[1])
-
     try:
-        asyncio.run(main(poll))
+        asyncio.run(main())
     except KeyboardInterrupt:
-        pass
-
+        print("🛑 sampler stopped")
