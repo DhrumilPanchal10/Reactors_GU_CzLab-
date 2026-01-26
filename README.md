@@ -112,17 +112,5 @@ This architecture supports long-running experiments without tying logging to the
 
 ---
 
-## Current Status
-- Reactor **R0** is fully implemented and validated  
-- Reactors **R1 and R2** are structured as placeholders and can be enabled once final NodeIds are provided  
-- The system is fully functional without physical hardware using the mock OPC-UA server  
 
----
-
-## Known Limitations (By Design)
-- R1/R2 are disabled until official NodeIds are confirmed  
-- Only `pwm0` is enabled; `pwm1–pwm3` can be added using the same pattern  
-- Calibration workflows are deferred to **Stage 3** (low priority)  
-
----
 
