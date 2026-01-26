@@ -1,292 +1,183 @@
-import asyncio
-import datetime
-import sqlite3
-from pathlib import Path
-
-import pandas as pd
+# app.py
 import streamlit as st
+from datetime import datetime, timezone
+from queue import Queue
 
-from client import ReactorOpcClient
+from streamlit_autorefresh import st_autorefresh
+from variable_map import reactor_map_R0, method_ids_R0
+from opc_worker import OpcWorker, Request
 
-# -------------------------
-# CONFIG
-# -------------------------
 ENDPOINT = "opc.tcp://localhost:4840/freeopcua/server/"
-DB_PATH = Path("data/stage2.sqlite")
 
-# R0 NodeIds (authoritative for your mock server + requirements)
-R0 = {
-    "object": "ns=2;i=1",
-    "ph": "ns=2;i=3",
-    "do": "ns=2;i=6",
-    "bio_415": "ns=2;i=9",
-    "setpoint": "ns=2;i=28",
-    "lb": "ns=2;i=26",
-    "ub": "ns=2;i=27",
-    "time_on": "ns=2;i=24",
-    "time_off": "ns=2;i=25",
-    "method": "ns=2;i=23",
-    "set_pairing": "ns=2;i=232",
-}
+st.set_page_config(page_title="Reactors HMI (Stage1+2)", layout="wide")
+st.title("Reactors HMI — Stage 1 (live) + Stage 2 (logging)")
+st.caption(f"Server endpoint: {ENDPOINT}")
 
-BIOMASS_TAGS = [
-    "biomass_415","biomass_445","biomass_480","biomass_515","biomass_555",
-    "biomass_590","biomass_630","biomass_680","biomass_clear","biomass_nir"
-]
+# -----------------------
+# Auto-refresh controls (SAFE)
+# -----------------------
+st.sidebar.header("Auto-refresh")
+auto_on = st.sidebar.toggle("Enable auto-refresh", value=False)
+auto_interval = st.sidebar.slider(
+    "Refresh interval (seconds)",
+    min_value=1,
+    max_value=10,
+    value=2,
+)
 
-# -------------------------
-# STREAMLIT SETUP
-# -------------------------
-st.set_page_config(page_title="Reactors HMI (Stage 1 + Stage 2)", layout="wide")
-st.title("Reactors HMI — Stage 1 (Control) + Stage 2 (Logging/Plots)")
+if auto_on:
+    # Causes Streamlit to rerun the script every N seconds
+    st_autorefresh(interval=auto_interval * 1000, key="auto_refresh")
 
-# -------------------------
-# SINGLE EVENT LOOP (CRITICAL)
-# -------------------------
-if "loop" not in st.session_state:
-    st.session_state.loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(st.session_state.loop)
+# --- start the worker once per session
+if "opc_worker" not in st.session_state:
+    w = OpcWorker()
+    w.start()
+    st.session_state["opc_worker"] = w
 
-def run(coro):
-    return st.session_state.loop.run_until_complete(coro)
+worker: OpcWorker = st.session_state["opc_worker"]
 
-# -------------------------
-# OPC CLIENT (Stage 1)
-# -------------------------
-if "client" not in st.session_state:
-    st.session_state.client = ReactorOpcClient(ENDPOINT)
-if "connected" not in st.session_state:
-    st.session_state.connected = False
+# --- mappings
+varmap = reactor_map_R0()
+methods = method_ids_R0()
 
-# -------------------------
-# DB HELPERS (Stage 2)
-# -------------------------
-def get_conn():
-    return sqlite3.connect(DB_PATH.as_posix(), check_same_thread=False)
+# --- storage
+if "r0_last" not in st.session_state:
+    st.session_state["r0_last"] = {}
 
-@st.cache_data(ttl=2)
-def list_available_reactors():
-    if not DB_PATH.exists():
-        return []
-    conn = get_conn()
-    try:
-        df = pd.read_sql_query("SELECT DISTINCT reactor FROM samples ORDER BY reactor", conn)
-        return df["reactor"].tolist()
-    finally:
-        conn.close()
+def rpc_read_all():
+    reply_q = Queue()
+    req = Request(kind="read_all", endpoint=ENDPOINT, variables=varmap, payload=None, reply_q=reply_q)
+    return worker.request(req, timeout=10)
 
-@st.cache_data(ttl=2)
-def list_available_tags(reactor: str):
-    if not DB_PATH.exists():
-        return []
-    conn = get_conn()
-    try:
-        df = pd.read_sql_query(
-            "SELECT DISTINCT tag FROM samples WHERE reactor=? ORDER BY tag",
-            conn,
-            params=(reactor,),
-        )
-        return df["tag"].tolist()
-    finally:
-        conn.close()
+def rpc_write(writes):
+    reply_q = Queue()
+    req = Request(kind="write", endpoint=ENDPOINT, variables=varmap, payload=writes, reply_q=reply_q)
+    return worker.request(req, timeout=10)
 
-@st.cache_data(ttl=2)
-def load_recent(reactor: str, tag: str, minutes: int):
-    conn = get_conn()
-    try:
-        since = (datetime.datetime.utcnow() - datetime.timedelta(minutes=minutes)).isoformat()
-        q = """
-        SELECT ts_utc, value
-        FROM samples
-        WHERE reactor = ? AND tag = ? AND ts_utc >= ?
-        ORDER BY ts_utc ASC
-        """
-        df = pd.read_sql_query(q, conn, params=(reactor, tag, since))
-        if df.empty:
-            return df
-        df["ts_utc"] = pd.to_datetime(df["ts_utc"])
-        df = df.set_index("ts_utc")
-        return df
-    finally:
-        conn.close()
+def rpc_call(method_nodeid):
+    reply_q = Queue()
+    req = Request(kind="call", endpoint=ENDPOINT, variables={}, payload=method_nodeid, reply_q=reply_q)
+    return worker.request(req, timeout=10)
 
-@st.cache_data(ttl=2)
-def load_latest(reactor: str, tag: str):
-    conn = get_conn()
-    try:
-        q = """
-        SELECT ts_utc, value
-        FROM samples
-        WHERE reactor = ? AND tag = ?
-        ORDER BY ts_utc DESC
-        LIMIT 1
-        """
-        df = pd.read_sql_query(q, conn, params=(reactor, tag))
-        if df.empty:
-            return None
-        return float(df.iloc[0]["value"])
-    finally:
-        conn.close()
+# --- UI
+st.header("R0")
 
-# -------------------------
-# TOP BAR: Connection + status
-# -------------------------
-top1, top2, top3 = st.columns([1, 2, 2])
+top = st.columns([1, 2, 2])
+with top[0]:
+    should_refresh = False
 
-with top1:
-    if st.button("Connect OPC-UA"):
-        try:
-            run(st.session_state.client.connect())
-            st.session_state.connected = True
-            st.success("Connected")
-        except Exception as e:
-            st.session_state.connected = False
-            st.error(f"Connect failed: {e}")
+if st.button("Refresh R0 (read values)"):
+    should_refresh = True
 
-with top2:
-    st.caption(f"OPC-UA endpoint: {ENDPOINT}")
+# Auto-refresh also triggers a read
+if auto_on:
+    should_refresh = True
 
-with top3:
-    if DB_PATH.exists():
-        st.caption(f"DB: {DB_PATH}")
+if should_refresh:
+    res = rpc_read_all()
+    if res["ok"]:
+        st.session_state["r0_last"] = res["data"]
+        if not auto_on:
+            st.success("Read OK")
     else:
-        st.caption("DB: not found (run sampler.py to create/populate)")
+        st.error(f"Read failed: {res['error']}")
+
+with top[1]:
+    st.write(f"Last refresh: {datetime.now(timezone.utc).isoformat()}")
+
+with top[2]:
+    if st.button("Disconnect all (stop worker)"):
+        worker.stop()
+        st.session_state.pop("opc_worker", None)
+        st.warning("Worker stopped. Reload page to restart.")
+
+st.subheader("Address space (selected variables)")
+left, mid, right = st.columns([2, 3, 2])
+left.markdown("**NodeId**")
+mid.markdown("**Tag**")
+right.markdown("**Value**")
+
+last = st.session_state["r0_last"]
+
+for nodeid, info in varmap.items():
+    tag = f"{info.reactor}:{info.group}:{info.channel}"
+    val = last.get(nodeid, "—")
+    left.code(nodeid)
+    mid.write(tag)
+    right.write(val)
 
 st.divider()
 
-# -------------------------
-# TABS: Stage 1 + Stage 2
-# -------------------------
-tab1, tab2 = st.tabs(["Stage 1 — Live Control", "Stage 2 — Logging & Plots"])
+st.subheader("Actuator controls — pwm0")
 
-# =========================
-# TAB 1: LIVE CONTROL
-# =========================
-with tab1:
-    if not st.session_state.connected:
-        st.warning("Start server (python -u mock_server.py), then click 'Connect OPC-UA'.")
-        st.stop()
+# find nodeids for pwm0 channels
+pwm0_nodes = {info.channel: nodeid for nodeid, info in varmap.items() if info.group == "pwm0"}
 
-    c = st.session_state.client
+if not pwm0_nodes:
+    st.error("pwm0 mappings missing in reactor_map_R0()")
+else:
+    with st.form("pwm0_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            method_in = st.text_input("R0 pwm0 method", value="PWM")
+            time_on_in = st.number_input("R0 pwm0 time_on (s)", value=0.0)
+            time_off_in = st.number_input("R0 pwm0 time_off (s)", value=0.0)
+        with c2:
+            lb_in = st.number_input("R0 pwm0 lb", value=0.0)
+            ub_in = st.number_input("R0 pwm0 ub", value=100.0)
+            setpoint_in = st.number_input("R0 pwm0 setpoint", value=0.0)
 
-    # Live reads
-    try:
-        ph = run(c.read(R0["ph"]))
-        do = run(c.read(R0["do"]))
-        bio = run(c.read(R0["bio_415"]))
-    except Exception as e:
-        st.error(f"Live read failed: {e}")
-        st.stop()
+        write_btn = st.form_submit_button("Write pwm0 for R0")
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("R0 pH", ph)
-    m2.metric("R0 DO (ppm)", do)
-    m3.metric("R0 Biomass 415", f"{bio:.3f}" if isinstance(bio, (float,int)) else str(bio))
+    if write_btn:
+        writes = {}
+        if "method" in pwm0_nodes:
+            writes[pwm0_nodes["method"]] = method_in
+        for k, v in [
+            ("time_on", float(time_on_in)),
+            ("time_off", float(time_off_in)),
+            ("lb", float(lb_in)),
+            ("ub", float(ub_in)),
+            ("setpoint", float(setpoint_in)),
+        ]:
+            if k in pwm0_nodes:
+                writes[pwm0_nodes[k]] = v
 
-    st.subheader("R0 Actuator Controls (pwm0 / ControlMethod)")
-
-    try:
-        curr_setpoint = float(run(c.read(R0["setpoint"])))
-        curr_lb = float(run(c.read(R0["lb"])))
-        curr_ub = float(run(c.read(R0["ub"])))
-        curr_ton = float(run(c.read(R0["time_on"])))
-        curr_toff = float(run(c.read(R0["time_off"])))
-        curr_method = str(run(c.read(R0["method"])))
-    except Exception as e:
-        st.error(f"Failed to read control params: {e}")
-        st.stop()
-
-    new_setpoint = st.number_input("setpoint", value=curr_setpoint)
-    new_lb = st.number_input("lb", value=curr_lb)
-    new_ub = st.number_input("ub", value=curr_ub)
-    new_ton = st.number_input("time_on (s)", value=curr_ton)
-    new_toff = st.number_input("time_off (s)", value=curr_toff)
-    new_method = st.text_input("method", value=curr_method)
-
-    a, b = st.columns(2)
-
-    with a:
-        if st.button("Write controls"):
-            try:
-                run(c.write(R0["setpoint"], new_setpoint))
-                run(c.write(R0["lb"], new_lb))
-                run(c.write(R0["ub"], new_ub))
-                run(c.write(R0["time_on"], new_ton))
-                run(c.write(R0["time_off"], new_toff))
-                run(c.write(R0["method"], new_method))
-                st.success("Wrote values")
-            except Exception as e:
-                st.error(f"Write failed: {e}")
-
-    with b:
-        if st.button("Call set_pairing"):
-            try:
-                res = run(c.call_method(R0["object"], R0["set_pairing"]))
-                st.write("Result:", res)
-            except Exception as e:
-                st.error(f"Method call failed: {e}")
-
-# =========================
-# TAB 2: LOGGING & PLOTS
-# =========================
-with tab2:
-    if not DB_PATH.exists():
-        st.warning("No DB found yet. Start logging in another terminal: python sampler.py 1")
-        st.stop()
-
-    reactors = list_available_reactors()
-    if not reactors:
-        st.warning("DB exists but has no data. Start sampler.py and wait ~5 seconds.")
-        st.stop()
-
-    left, right = st.columns([1, 3])
-
-    with left:
-        reactor = st.selectbox("Reactor", reactors)
-        minutes = st.slider("Time window (minutes)", 1, 180, 10, step=1)
-
-        tags = list_available_tags(reactor)
-        # default biomass selection if present
-        default = [t for t in BIOMASS_TAGS if t in tags]
-        if not default:
-            default = tags[:3] if tags else []
-
-        selected = st.multiselect("Plot channels", options=tags, default=default)
-
-    with right:
-        st.subheader(f"{reactor} — plots (last {minutes} min)")
-
-        if not selected:
-            st.info("Select at least one channel to plot.")
+        res = rpc_write(writes)
+        if res["ok"]:
+            st.success("Write OK")
+            st.json(res["data"])
         else:
-            dfs = []
-            for tag in selected:
-                df = load_recent(reactor, tag, minutes)
-                if df.empty:
-                    continue
-                dfs.append(df.rename(columns={"value": tag}))
-            if not dfs:
-                st.info("No data in that time window yet. Increase the window or wait for sampler.")
+            st.error(f"Write failed: {res['error']}")
+
+st.divider()
+
+st.subheader("Methods")
+
+m1, m2 = st.columns(2)
+with m1:
+    if st.button("Call set_pairing (R0)"):
+        nid = methods.get("set_pairing")
+        if not nid:
+            st.error("set_pairing NodeId missing in method_ids_R0()")
+        else:
+            res = rpc_call(nid)
+            if res["ok"]:
+                st.success(f"set_pairing OK: {res['data']}")
             else:
-                combined = pd.concat(dfs, axis=1).dropna(how="all")
-                st.line_chart(combined)
+                st.error(f"set_pairing failed: {res['error']}")
 
-        st.divider()
-        st.subheader("Latest values")
-        show_tags = ["ph_pH", "do_ppm", "biomass_415", "pwm0_setpoint", "pwm0_lb", "pwm0_ub"]
-        cols = st.columns(3)
-        for i, tag in enumerate(show_tags):
-            val = load_latest(reactor, tag) if tag in tags else None
-            cols[i % 3].metric(tag, "—" if val is None else f"{val:.3f}")
+with m2:
+    if st.button("Call unpair (R0)"):
+        nid = methods.get("unpair")
+        if not nid:
+            st.error("unpair NodeId missing in method_ids_R0()")
+        else:
+            res = rpc_call(nid)
+            if res["ok"]:
+                st.success(f"unpair OK: {res['data']}")
+            else:
+                st.error(f"unpair failed: {res['error']}")
 
-        with st.expander("Raw rows (latest 200)"):
-            conn = get_conn()
-            try:
-                df = pd.read_sql_query(
-                    "SELECT ts_utc, tag, nodeid, value FROM samples WHERE reactor=? ORDER BY ts_utc DESC LIMIT 200",
-                    conn,
-                    params=(reactor,),
-                )
-                st.dataframe(df)
-            finally:
-                conn.close()
+st.info("R1/R2 will work once you add their mappings in variable_map.py (reactor_map_R1/R2 + method_ids_R1/R2).")

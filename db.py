@@ -1,47 +1,56 @@
+# db.py
 import sqlite3
 from pathlib import Path
+from typing import Dict, Any
 
 DB_PATH = Path("data/stage2.sqlite")
 
-SCHEMA = """
-CREATE TABLE IF NOT EXISTS samples (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    ts_utc TEXT NOT NULL,
-    reactor TEXT NOT NULL,
-    tag TEXT NOT NULL,
-    nodeid TEXT NOT NULL,
-    value REAL NOT NULL
-);
-
-CREATE INDEX IF NOT EXISTS idx_samples_ts ON samples(ts_utc);
-CREATE INDEX IF NOT EXISTS idx_samples_reactor_tag ON samples(reactor, tag);
-"""
-
-def get_conn():
+def ensure_db():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH.as_posix(), check_same_thread=False)
-    return conn
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS experiments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            reactor TEXT NOT NULL,
+            started_at_utc TEXT NOT NULL
+        );
+        """)
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            experiment_id INTEGER NOT NULL,
+            ts_utc TEXT NOT NULL,
+            nodeid TEXT NOT NULL,
+            tag TEXT NOT NULL,
+            value REAL,
+            FOREIGN KEY(experiment_id) REFERENCES experiments(id)
+        );
+        """)
+        con.commit()
+
+def create_experiment(name: str, reactor: str, started_at_utc: str) -> int:
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO experiments (name, reactor, started_at_utc) VALUES (?, ?, ?)",
+            (name, reactor, started_at_utc),
+        )
+        con.commit()
+        return int(cur.lastrowid)
+
+def insert_sample(experiment_id: int, ts_utc: str, nodeid: str, tag: str, value: float):
+    ensure_db()
+    with sqlite3.connect(DB_PATH) as con:
+        cur = con.cursor()
+        cur.execute(
+            "INSERT INTO samples (experiment_id, ts_utc, nodeid, tag, value) VALUES (?, ?, ?, ?, ?)",
+            (experiment_id, ts_utc, nodeid, tag, float(value)),
+        )
+        con.commit()
 
 def init_db():
-    conn = get_conn()
-    try:
-        conn.executescript(SCHEMA)
-        conn.commit()
-    finally:
-        conn.close()
-
-def insert_samples(rows):
-    """
-    rows: list of tuples (ts_utc, reactor, tag, nodeid, value)
-    """
-    if not rows:
-        return
-    conn = get_conn()
-    try:
-        conn.executemany(
-            "INSERT INTO samples (ts_utc, reactor, tag, nodeid, value) VALUES (?, ?, ?, ?, ?)",
-            rows
-        )
-        conn.commit()
-    finally:
-        conn.close()
+    # Backwards-compatible alias for older code
+    ensure_db()
