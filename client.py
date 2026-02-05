@@ -1,9 +1,9 @@
 # client.py
 import logging
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, List
 
-from asyncua import Client
+from asyncua import Client, ua
 
 log = logging.getLogger("ReactorOpcClient")
 logging.basicConfig(level=logging.INFO)
@@ -15,10 +15,14 @@ METHOD_ENUM_INV = {v: k for k, v in METHOD_ENUM.items()}
 @dataclass
 class VarInfo:
     reactor: str
-    name: str          # group name: ph/do/biomass/pwm0...
-    channel: str       # pH/ppm/oC/415/.../method/time_on...
-    nodeid: str        # "ns=2;i=3"
+    name: str
+    channel: str
+    nodeid: str
     value: Any = None
+
+
+# Compatibility alias (some modules used VariableInfo)
+VariableInfo = VarInfo
 
 
 class _SubHandler:
@@ -34,20 +38,18 @@ class _SubHandler:
 
 class ReactorOpcClient:
     """
-    Requirements-compliant client:
-    - connect()
-    - browse_address_space() -> builds sensor_vars, actuator_vars, methods
-    - init_subscriptions(...) -> subscribes to all monitored vars
-    - write(nodeid, value) / write_bulk(dict)
-    - call_method(nodeid)
-    - read_snapshot() -> {nodeid: value}
+    OPC-UA client that:
+      - connects to endpoint
+      - browses address space (sensors, actuators, methods)
+      - subscribes to data changes
+      - read/write/call methods with args
     """
 
     def __init__(self, endpoint: str):
         self.endpoint = endpoint
         self.client = Client(url=endpoint)
 
-        # Per requirement: { nodeid_str: {"reactor":"R0","name":"do","channel":"ppm","value":7.8} }
+        # Per requirement: { "ns=2;i=3": {"reactor":"R0", "name":"do", "channel":"ppm", "value":7.8} }
         self.sensor_vars: Dict[str, Dict[str, Any]] = {}
         self.actuator_vars: Dict[str, Dict[str, Any]] = {}
         self.methods: Dict[str, Dict[str, Any]] = {}
@@ -60,6 +62,7 @@ class ReactorOpcClient:
     async def connect(self):
         await self.client.connect()
         log.info("Connected to %s", self.endpoint)
+        # browse on connect
         await self.browse_address_space()
         return True
 
@@ -77,10 +80,7 @@ class ReactorOpcClient:
 
     async def browse_address_space(self):
         """
-        Automatically discovers reactors (R0,R1,R2) and captures:
-          - sensors: ph(pH,oC), do(ppm,oC), biomass(10 chans)
-          - actuators: pwm0-3 control vars including method/time_on/time_off/lb/ub/setpoint
-          - methods: set_pairing, unpair
+        Discover reactors and populate sensor_vars, actuator_vars, methods.
         """
         self.sensor_vars.clear()
         self.actuator_vars.clear()
@@ -91,12 +91,17 @@ class ReactorOpcClient:
 
         reactors = {}
         for n in kids:
-            bn = await n.read_browse_name()
+            try:
+                bn = await n.read_browse_name()
+            except Exception:
+                bn = None
             if bn and bn.Name in {"R0", "R1", "R2"}:
                 reactors[bn.Name] = n
 
         for rname, rnode in reactors.items():
             await self._browse_reactor(rname, rnode)
+            # Also collect methods anywhere under reactor
+            await self._collect_methods_recursive(rname, rnode, max_depth=6)
 
         log.info(
             "Browse complete. sensors=%d actuators=%d methods=%d",
@@ -110,10 +115,12 @@ class ReactorOpcClient:
 
     async def _browse_reactor(self, reactor: str, reactor_node):
         children = await reactor_node.get_children()
-
         by_name = {}
         for ch in children:
-            bn = await ch.read_browse_name()
+            try:
+                bn = await ch.read_browse_name()
+            except Exception:
+                bn = None
             if bn:
                 by_name[bn.Name] = ch
 
@@ -125,15 +132,17 @@ class ReactorOpcClient:
             elif key.endswith(":biomass"):
                 await self._browse_biomass(reactor, node)
             elif ":pwm" in key:
-                group = key.split(":")[-1]  # pwm0/pwm1/...
+                group = key.split(":")[-1]
                 await self._browse_pwm(reactor, group, node)
             elif key in {"set_pairing", "unpair"}:
                 nid = node.nodeid.to_string()
                 self.methods[nid] = {"reactor": reactor, "name": key, "channel": "", "value": None}
 
-        # Fallback scan for methods (depends on namespace formatting)
         for ch in children:
-            bn = await ch.read_browse_name()
+            try:
+                bn = await ch.read_browse_name()
+            except Exception:
+                bn = None
             if bn and bn.Name in {"set_pairing", "unpair"}:
                 nid = ch.nodeid.to_string()
                 self.methods[nid] = {"reactor": reactor, "name": bn.Name, "channel": "", "value": None}
@@ -141,10 +150,13 @@ class ReactorOpcClient:
     async def _browse_sensor_group(self, reactor: str, group: str, group_node):
         vars_ = await group_node.get_children()
         for v in vars_:
-            bn = await v.read_browse_name()
+            try:
+                bn = await v.read_browse_name()
+            except Exception:
+                bn = None
             if not bn:
                 continue
-            channel = bn.Name.split(":")[-1]  # pH/ppm/oC
+            channel = bn.Name.split(":")[-1]
             nid = v.nodeid.to_string()
             try:
                 val = await v.read_value()
@@ -155,10 +167,13 @@ class ReactorOpcClient:
     async def _browse_biomass(self, reactor: str, group_node):
         vars_ = await group_node.get_children()
         for v in vars_:
-            bn = await v.read_browse_name()
+            try:
+                bn = await v.read_browse_name()
+            except Exception:
+                bn = None
             if not bn:
                 continue
-            channel = bn.Name.split(":")[-1]  # 415/445/.../nir/clear
+            channel = bn.Name.split(":")[-1]
             nid = v.nodeid.to_string()
             try:
                 val = await v.read_value()
@@ -168,17 +183,21 @@ class ReactorOpcClient:
 
     async def _browse_pwm(self, reactor: str, group: str, pwm_node):
         kids = await pwm_node.get_children()
-
         ctrl = None
         for ch in kids:
-            bn = await ch.read_browse_name()
+            try:
+                bn = await ch.read_browse_name()
+            except Exception:
+                bn = None
             if bn and bn.Name == "ControlMethod":
                 ctrl = ch
                 break
 
-        # curr_value directly under pwm node
         for ch in kids:
-            bn = await ch.read_browse_name()
+            try:
+                bn = await ch.read_browse_name()
+            except Exception:
+                bn = None
             if bn and bn.Name == "curr_value":
                 nid = ch.nodeid.to_string()
                 try:
@@ -192,7 +211,10 @@ class ReactorOpcClient:
 
         ctrl_kids = await ctrl.get_children()
         for v in ctrl_kids:
-            bn = await v.read_browse_name()
+            try:
+                bn = await v.read_browse_name()
+            except Exception:
+                bn = None
             if not bn:
                 continue
             channel = bn.Name
@@ -205,33 +227,40 @@ class ReactorOpcClient:
                 val = None
             self.actuator_vars[nid] = {"reactor": reactor, "name": group, "channel": channel, "value": val}
 
-    async def init_subscriptions(
-        self,
-        on_change: Optional[Callable[[str, Any], None]] = None,
-        on_change_cb: Optional[Callable[[str, Any], None]] = None,
-        **_ignored_kwargs,
-    ):
-        """
-        Subscribes to all sensor + actuator vars.
-        Accepts BOTH parameter names to avoid mismatches with callers:
-          - on_change
-          - on_change_cb
-        """
-        self._on_change_cb = on_change_cb or on_change
+    async def _collect_methods_recursive(self, reactor: str, root_node, max_depth: int = 4):
+        async def walk(node, depth: int):
+            if depth > max_depth:
+                return
+            try:
+                kids = await node.get_children()
+            except Exception:
+                return
+            for ch in kids:
+                try:
+                    bn = await ch.read_browse_name()
+                    nc = await ch.read_node_class()
+                except Exception:
+                    continue
+                if nc == ua.NodeClass.Method:
+                    nid = ch.nodeid.to_string()
+                    self.methods[nid] = {"reactor": reactor, "name": (bn.Name if bn else ""), "channel": "", "value": None}
+                else:
+                    if nc == ua.NodeClass.Object:
+                        await walk(ch, depth + 1)
+        await walk(root_node, 0)
 
+    async def init_subscriptions(self, on_change: Optional[Callable[[str, Any], None]] = None, on_change_cb: Optional[Callable[[str, Any], None]] = None, **_ignored):
+        self._on_change_cb = on_change_cb or on_change
         self._sub_handler = _SubHandler(self._handle_change)
         self._subscription = await self.client.create_subscription(500, self._sub_handler)
-
         nodeids = list(self.sensor_vars.keys()) + list(self.actuator_vars.keys())
         nodes = [self.client.get_node(nid) for nid in nodeids]
-
         if nodes:
             handles = await self._subscription.subscribe_data_change(nodes)
             if isinstance(handles, list):
                 self._sub_handles.extend(handles)
             else:
                 self._sub_handles.append(handles)
-
         return True
 
     def _handle_change(self, nodeid: str, value: Any):
@@ -239,14 +268,13 @@ class ReactorOpcClient:
             self.sensor_vars[nodeid]["value"] = value
         elif nodeid in self.actuator_vars:
             self.actuator_vars[nodeid]["value"] = value
-
         if self._on_change_cb:
             try:
                 self._on_change_cb(nodeid, value)
             except Exception:
                 pass
 
-    async def read_snapshot(self) -> Dict[str, Any]:
+    async def read_snapshot(self):
         snap: Dict[str, Any] = {}
         for nid, info in self.sensor_vars.items():
             snap[nid] = info.get("value")
@@ -256,18 +284,13 @@ class ReactorOpcClient:
 
     async def write(self, nodeid: str, value: Any):
         node = self.client.get_node(nodeid)
-
-        # Allow GUI to pass either label or int for method
         if isinstance(value, str) and value in METHOD_ENUM_INV:
             value = METHOD_ENUM_INV[value]
-
         await node.write_value(value)
-
         if nodeid in self.actuator_vars:
             self.actuator_vars[nodeid]["value"] = value
         elif nodeid in self.sensor_vars:
             self.sensor_vars[nodeid]["value"] = value
-
         return True
 
     async def write_bulk(self, writes: Dict[str, Any]):
@@ -275,7 +298,9 @@ class ReactorOpcClient:
             await self.write(nid, val)
         return True
 
-    async def call_method(self, method_nodeid: str):
+    async def call_method(self, method_nodeid: str, args: Optional[List[Any]] = None):
+        if args is None:
+            args = []
         node = self.client.get_node(method_nodeid)
         parent = await node.get_parent()
-        return await parent.call_method(node)
+        return await parent.call_method(node, *args)

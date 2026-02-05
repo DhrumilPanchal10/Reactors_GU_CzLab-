@@ -1,21 +1,17 @@
 # gui.py  (Stage 2 updated — selectable biomass channels)
-import sqlite3
 import pandas as pd
 import streamlit as st
-from pathlib import Path
 import datetime
-
-DB_PATH = Path("data/stage2.sqlite")
+import db_pg
 
 st.set_page_config(page_title="Stage 2 — Reactors Dashboard (Select Channels)", layout="wide")
 st.title("Stage 2 — Reactors Dashboard (Select biomass channels)")
 
-if not DB_PATH.exists():
-    st.error(f"Database not found at {DB_PATH}. Run sampler.py first to populate data.")
-    st.stop()
+# Ensure DB tables exist
+db_pg.ensure_db()
 
 def get_conn():
-    return sqlite3.connect(DB_PATH.as_posix(), check_same_thread=False)
+    return db_pg.get_pg_conn()
 
 @st.cache_data(ttl=2)
 def load_recent(reactor: str, tag: str, minutes: int):
@@ -23,10 +19,11 @@ def load_recent(reactor: str, tag: str, minutes: int):
     try:
         since = (datetime.datetime.utcnow() - datetime.timedelta(minutes=minutes)).isoformat()
         q = """
-        SELECT ts_utc, value
-        FROM samples
-        WHERE reactor = ? AND tag = ? AND ts_utc >= ?
-        ORDER BY ts_utc ASC
+        SELECT s.ts_utc, s.value
+        FROM samples s
+        JOIN experiments e ON s.experiment_id = e.id
+        WHERE e.reactor = %s AND s.tag = %s AND s.ts_utc >= %s
+        ORDER BY s.ts_utc ASC
         """
         df = pd.read_sql_query(q, conn, params=(reactor, tag, since))
         if len(df) == 0:
@@ -42,11 +39,12 @@ def list_available_tags(reactor: str, limit=1000):
     conn = get_conn()
     try:
         q = """
-        SELECT DISTINCT tag
-        FROM samples
-        WHERE reactor = ?
-        ORDER BY tag ASC
-        LIMIT ?
+        SELECT DISTINCT s.tag
+        FROM samples s
+        JOIN experiments e ON s.experiment_id = e.id
+        WHERE e.reactor = %s
+        ORDER BY s.tag ASC
+        LIMIT %s
         """
         df = pd.read_sql_query(q, conn, params=(reactor, limit))
         return df["tag"].tolist()
@@ -82,9 +80,10 @@ if not selected:
 # Latest metrics: read the most recent value per tag for quick glance
 def load_latest_value(conn, reactor, tag):
     q = """
-    SELECT ts_utc, value FROM samples
-    WHERE reactor = ? AND tag = ?
-    ORDER BY ts_utc DESC LIMIT 1
+    SELECT s.ts_utc, s.value FROM samples s
+    JOIN experiments e ON s.experiment_id = e.id
+    WHERE e.reactor = %s AND s.tag = %s
+    ORDER BY s.ts_utc DESC LIMIT 1
     """
     df = pd.read_sql_query(q, conn, params=(reactor, tag))
     if df.empty:
@@ -135,7 +134,11 @@ try:
     tags_act = ["pwm0_setpoint","pwm0_lb","pwm0_ub"]
     latest_act = {}
     for t in tags_act:
-        r = pd.read_sql_query("SELECT value FROM samples WHERE reactor=? AND tag=? ORDER BY ts_utc DESC LIMIT 1", conn, params=(reactor,t))
+        r = pd.read_sql_query("""
+            SELECT s.value FROM samples s
+            JOIN experiments e ON s.experiment_id = e.id
+            WHERE e.reactor=%s AND s.tag=%s ORDER BY s.ts_utc DESC LIMIT 1
+        """, conn, params=(reactor,t))
         latest_act[t] = None if r.empty else float(r.iloc[0]["value"])
 finally:
     conn.close()
@@ -149,10 +152,11 @@ with st.expander("Raw recent rows for reactor"):
     conn = get_conn()
     try:
         q = """
-        SELECT ts_utc, tag, nodeid, value
-        FROM samples
-        WHERE reactor = ?
-        ORDER BY ts_utc DESC
+        SELECT s.ts_utc, s.tag, s.nodeid, s.value
+        FROM samples s
+        JOIN experiments e ON s.experiment_id = e.id
+        WHERE e.reactor = %s
+        ORDER BY s.ts_utc DESC
         LIMIT 500
         """
         df = pd.read_sql_query(q, conn, params=(reactor,))

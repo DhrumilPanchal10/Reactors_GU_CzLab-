@@ -108,10 +108,13 @@ class OpcWorker:
             self.latest_values[nodeid] = value
 
         await self.client.connect()
-        self.mappings = await self.client.browse_address_space()
-        await self.client.init_subscriptions(on_change_cb=on_change)
+        # browse_address_space already executed inside connect(), but call again to be explicit
+        mappings = await self.client.browse_address_space()
+        self.mappings = mappings
+        # init subscriptions, provide on_change callback
+        await self.client.init_subscriptions(on_change=on_change)
 
-        # Prime worker snapshot with current dictionary values
+        # Prime latest_values with current snapshot
         self.latest_values.update(await self.client.read_snapshot())
 
         return {"ok": True, "mappings": self.mappings}
@@ -123,10 +126,23 @@ class OpcWorker:
         self.latest_values.update(writes)
         return {"ok": True, "data": writes}
 
-    async def _call(self, method_nodeid: str):
+    async def _call(self, payload):
         if not self.client:
             return {"ok": False, "error": "not connected"}
-        out = await self.client.call_method(method_nodeid)
+
+        nodeid = None
+        args = []
+
+        if isinstance(payload, str):
+            nodeid = payload
+        elif isinstance(payload, dict):
+            nodeid = payload.get("nodeid")
+            args = payload.get("args") or []
+        else:
+            return {"ok": False, "error": f"invalid call payload type: {type(payload)}"}
+
+        if not nodeid:
+            return {"ok": False, "error": "missing method nodeid"}
+
+        out = await self.client.call_method(nodeid, args=args)
         return {"ok": True, "data": out}
-    
-    

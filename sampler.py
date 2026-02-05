@@ -1,68 +1,75 @@
 # sampler.py
 import asyncio
-from datetime import datetime, timezone
 import sys
-from typing import Any
+from datetime import datetime, timezone
 
 from client import ReactorOpcClient
-from db import ensure_db, create_experiment, insert_sample
+import db_pg
 
 ENDPOINT = "opc.tcp://localhost:4840/freeopcua/server/"
-DEFAULT_REACTOR = "R0"
+POLL_DEFAULT = 1.0
 
 
-def _is_number(x: Any) -> bool:
-    return isinstance(x, (int, float)) and not isinstance(x, bool)
+def _tag(info: dict) -> str:
+    return f"{info.get('reactor','')}:{info.get('name','')}:{info.get('channel','')}".strip(":")
 
 
-async def main():
-    ensure_db()
-
-    reactor = DEFAULT_REACTOR
-    exp_id = create_experiment(
-        name="Stage2 demo run",
-        reactor=reactor,
-        started_at_utc=datetime.now(timezone.utc).isoformat(),
-    )
+async def main(poll_s: float):
+    dbtype = db_pg.ensure_db()
+    print(f"[sampler] DB type: {dbtype}")
 
     client = ReactorOpcClient(endpoint=ENDPOINT)
     await client.connect()
 
-    print(f"✅ Connected to {ENDPOINT}")
-    print(f"✅ Experiment created exp_id={exp_id}")
-    print("✅ Starting subscriptions (no polling)")
+    mappings = await client.browse_address_space()
+    sensor_vars = mappings.get("sensor_vars", {}) or {}
 
-    # On every subscribed value change: log numeric to DB
-    def on_change(nodeid: str, value: Any):
-        try:
-            # Decide whether it's a sensor or actuator based on client dicts
-            info = client.sensor_vars.get(nodeid) or client.actuator_vars.get(nodeid)
-            if not info:
-                return
+    reactors = sorted({info.get("reactor") for info in sensor_vars.values() if isinstance(info, dict) and info.get("reactor")})
+    if not reactors:
+        reactors = ["R0"]
 
-            # only log numeric values to samples.value
-            if not _is_number(value):
-                return
+    exp_ids = {}
+    for r in reactors:
+        exp_id = db_pg.create_experiment(
+            name="Stage2 demo run",
+            reactor=r,
+            started_at_utc=datetime.now(timezone.utc).isoformat(),
+        )
+        exp_ids[r] = exp_id
+        print(f"✅ Reactor: {r} -> experiment {exp_id}")
 
-            ts = datetime.now(timezone.utc).isoformat()
-            tag = f"{info['reactor']}:{info['name']}:{info['channel']}"
-            insert_sample(exp_id, ts, nodeid, tag, float(value))
-        except Exception:
-            # do not crash callback
-            return
+    print(f"✅ Sampler connected to {ENDPOINT}")
+    print(f"✅ Logging to DB for reactors: {', '.join(reactors)}")
+    print(f"⏱️ Interval: {poll_s}s (Ctrl+C to stop)")
 
-    await client.init_subscriptions(on_change=on_change)
-
-    print("⏱️ Sampler running. Ctrl+C to stop.")
     try:
         while True:
-            await asyncio.sleep(1.0)
+            ts = datetime.now(timezone.utc).isoformat()
+
+            for nid, info in sensor_vars.items():
+                if not isinstance(info, dict):
+                    continue
+                reactor = info.get("reactor")
+                if reactor not in exp_ids:
+                    continue
+                try:
+                    node = client.client.get_node(nid)
+                    v = await node.read_value()
+                    if isinstance(v, (int, float)):
+                        db_pg.insert_sample(exp_ids[reactor], ts, nid, _tag(info), float(v))
+                except Exception:
+                    pass
+
+            await asyncio.sleep(poll_s)
     finally:
         await client.disconnect()
 
 
 if __name__ == "__main__":
+    poll = POLL_DEFAULT
+    if len(sys.argv) > 1:
+        poll = float(sys.argv[1])
     try:
-        asyncio.run(main())
+        asyncio.run(main(poll))
     except KeyboardInterrupt:
         print("🛑 sampler stopped")
